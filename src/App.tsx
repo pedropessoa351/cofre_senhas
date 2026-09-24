@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "./supabase";
+import { store } from "./store";
 import { decryptJSON, deriveAuthSecret, deriveVaultKey, encryptJSON, generatePassword } from "./crypto";
 
 type Secret = { title: string; username: string; password: string; url: string; notes: string };
@@ -16,7 +17,7 @@ export default function App() {
   const [shown, setShown] = useState<string | null>(null);
   const timer = useRef<number>();
 
-  const lock = async () => { setKey(null); setItems([]); setEdit(null); await supabase.auth.signOut(); };
+  const lock = async () => { setKey(null); setItems([]); setEdit(null); await supabase?.auth.signOut(); };
 
   // Bloqueio automático após 5 minutos sem uso
   useEffect(() => {
@@ -28,7 +29,7 @@ export default function App() {
   }, [key]);
 
   async function load(k: CryptoKey) {
-    const { data } = await supabase.from("vault_items").select("*").order("created_at");
+    const data = await store.list();
     const out: Item[] = [];
     for (const r of data ?? []) out.push({ id: r.id, ...(await decryptJSON<Secret>(k, r.iv, r.ciphertext)) });
     setItems(out);
@@ -37,14 +38,13 @@ export default function App() {
   async function save() {
     if (!key || !edit || !edit.title) return;
     const payload = await encryptJSON(key, { title: edit.title, username: edit.username, password: edit.password, url: edit.url, notes: edit.notes });
-    if (edit.id) await supabase.from("vault_items").update({ ...payload, updated_at: new Date().toISOString() }).eq("id", edit.id);
-    else await supabase.from("vault_items").insert(payload);
+    await store.save(payload, edit.id);
     setEdit(null); load(key);
   }
 
   async function remove(id: string) {
     if (!key || !confirm("Excluir este item? Não dá para desfazer.")) return;
-    await supabase.from("vault_items").delete().eq("id", id); load(key);
+    await store.remove(id); load(key);
   }
 
   const copy = async (t: string) => { await navigator.clipboard.writeText(t); setTimeout(() => navigator.clipboard.writeText(""), 20000); };
@@ -97,20 +97,36 @@ export default function App() {
 }
 
 function Login({ onDone }: { onDone: (k: CryptoKey, email: string) => void }) {
-  const [mode, setMode] = useState<"in" | "up">("in");
+  const local = !supabase;
+  const hasVault = local && !!localStorage.getItem("cofre.check");
+  const [mode, setMode] = useState<"in" | "up">(local && !hasVault ? "up" : "in");
   const [email, setEmail] = useState("");
   const [master, setMaster] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const LOCAL = "Cofre neste dispositivo";
 
   async function go() {
     setErr(""); setBusy(true);
     try {
       if (mode === "up" && master.length < 12) throw new Error("A senha mestra precisa ter pelo menos 12 caracteres.");
+      if (local) {
+        if (mode === "up") {
+          const salt = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+          const k = await deriveVaultKey(master, "local:" + salt);
+          localStorage.setItem("cofre.salt", salt);
+          localStorage.setItem("cofre.check", JSON.stringify(await encryptJSON(k, { ok: true })));
+          return onDone(k, LOCAL);
+        }
+        const k = await deriveVaultKey(master, "local:" + localStorage.getItem("cofre.salt"));
+        const c = JSON.parse(localStorage.getItem("cofre.check")!);
+        try { await decryptJSON(k, c.iv, c.ciphertext); } catch { throw new Error("Senha mestra incorreta."); }
+        return onDone(k, LOCAL);
+      }
       const secret = await deriveAuthSecret(master, email);
       const { error } = mode === "up"
-        ? await supabase.auth.signUp({ email, password: secret })
-        : await supabase.auth.signInWithPassword({ email, password: secret });
+        ? await supabase!.auth.signUp({ email, password: secret })
+        : await supabase!.auth.signInWithPassword({ email, password: secret });
       if (error) throw new Error(error.message);
       onDone(await deriveVaultKey(master, email), email);
     } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
@@ -119,13 +135,14 @@ function Login({ onDone }: { onDone: (k: CryptoKey, email: string) => void }) {
   return (
     <div className="login">
       <h1>Cofre</h1>
-      <p>Suas senhas são cifradas no seu navegador. Ninguém, nem o servidor, consegue lê-las sem a senha mestra.</p>
-      <label>E-mail<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+      <p>Suas senhas são cifradas no seu navegador. Ninguém consegue lê-las sem a senha mestra.</p>
+      {local && <p className="note">Modo local: os dados ficam só neste navegador. Limpar os dados do navegador apaga o cofre.</p>}
+      {!local && <label>E-mail<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>}
       <label>Senha mestra<input type="password" value={master} onChange={(e) => setMaster(e.target.value)} onKeyDown={(e) => e.key === "Enter" && go()} /></label>
       {mode === "up" && <p className="warn">Se você esquecer a senha mestra, não há como recuperar o cofre. Anote-a em um lugar seguro.</p>}
       {err && <p className="err">{err}</p>}
-      <button disabled={busy || !email || !master} onClick={go}>{busy ? "Aguarde…" : mode === "in" ? "Abrir cofre" : "Criar cofre"}</button>
-      <button className="ghost" onClick={() => setMode(mode === "in" ? "up" : "in")}>{mode === "in" ? "Criar uma conta" : "Já tenho conta"}</button>
+      <button disabled={busy || !master || (!local && !email)} onClick={go}>{busy ? "Aguarde…" : mode === "in" ? "Abrir cofre" : "Criar cofre"}</button>
+      {!local && <button className="ghost" onClick={() => setMode(mode === "in" ? "up" : "in")}>{mode === "in" ? "Criar uma conta" : "Já tenho conta"}</button>}
     </div>
   );
 }

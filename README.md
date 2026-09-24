@@ -9,7 +9,15 @@ Inspirado no modelo *zero-knowledge* do Keeper: a senha mestra nunca sai do nave
 - Bloqueio automático após 5 min sem atividade; a área de transferência é limpa após 20 s.
 - Sem a senha mestra não há recuperação. Isso é proposital.
 
-## Configuração
+## Rodar (modo local, sem Supabase)
+`npm install && npm run dev` (abre em localhost). Para gerar o site: `npm run build` e abrir `dist/index.html` (arquivo único).
+**Não abra o `index.html` da raiz** — ele é só o código-fonte e fica em branco sem o build.
+
+## GitHub Pages
+Em Settings → Pages → Source, escolha **GitHub Actions**. Cada push na `main` publica sozinho.
+Para ligar o Supabase depois: Settings → Secrets → Actions → crie `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`.
+
+## Configuração do Supabase (opcional)
 1. Crie um projeto no [Supabase](https://supabase.com) e rode `supabase/schema.sql` no SQL Editor.
 2. Em Authentication → Providers → Email, deixe e-mail/senha ativo (desative "Confirm email" para testes locais).
 3. `cp .env.example .env` e preencha URL e chave *anon*.
