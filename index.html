@@ -4,8 +4,205 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Cofre</title>
-<link rel="preconnect" href="https://fonts.googleapis.com" />
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+:root{--bg:#f3f5f4;--ink:#14231f;--mute:#5b6b66;--line:#d5dcd9;--card:#fff;--acc:#0f5c4d;--danger:#a43a2a}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1614;--ink:#e6efec;--mute:#93a59f;--line:#26362f;--card:#152220;--acc:#5fd0b4;--danger:#e58b7a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.5 "IBM Plex Sans",system-ui,sans-serif}
+h1,h2{font-family:"Bricolage Grotesque",system-ui,sans-serif;margin:0}
+button{font:500 14px "IBM Plex Sans",system-ui,sans-serif;padding:8px 14px;border:1px solid var(--acc);background:var(--acc);color:var(--bg);border-radius:6px;cursor:pointer}
+button.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
+button.danger{color:var(--danger)}
+button:disabled{opacity:.5}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+input,textarea{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);font:inherit}
+label{display:block;margin:12px 0;font-size:14px;color:var(--mute)}
+label input,label textarea{margin-top:4px}
+.shell{max-width:820px;margin:0 auto;padding:24px 16px}
+header{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+header h1{font-size:28px;margin-right:auto}
+.search{width:220px}
+.who{color:var(--mute);font-size:14px;margin:8px 0 16px}
+ul{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+li{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line)}
+.main{flex:1 1 200px;display:flex;flex-direction:column}.main span{color:var(--mute);font-size:14px}
+code{font-size:14px;min-width:120px}
+.empty{color:var(--mute);padding:32px 0}
+.login{max-width:400px;margin:12vh auto;padding:0 16px;display:grid;gap:4px}
+.login h1{font-size:40px}.login p{color:var(--mute)}
+.warn,.err{color:var(--danger)}.warn,.note{font-size:14px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:grid;place-items:center;padding:16px}
+.card{background:var(--card);border-radius:10px;padding:20px;width:100%;max-width:440px;max-height:90vh;overflow:auto}
+.row{display:flex;gap:8px}.end{justify-content:flex-end;margin-top:8px}
+#fatal{padding:24px;color:#a43a2a;font-family:monospace;white-space:pre-wrap}
+</style>
 </head>
-<body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body>
+<body>
+<div id="root"><p style="padding:24px">Carregando…</p></div>
+<div id="fatal"></div>
+<script>
+// Se algo falhar (ex.: CDN bloqueado), o erro aparece na tela em vez de ficar em branco.
+window.addEventListener("error", e => { document.getElementById("fatal").textContent = "Erro: " + e.message; });
+window.addEventListener("unhandledrejection", e => { document.getElementById("fatal").textContent = "Erro: " + (e.reason && e.reason.message || e.reason); });
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ---------- Criptografia (tudo no navegador) ----------
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = (b) => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+async function deriveKey(master, salt) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(master), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(salt), iterations: 600000 },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+async function encryptJSON(key, data) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(data)));
+  return { iv: b64(iv), ciphertext: b64(ct) };
+}
+async function decryptJSON(key, iv, ciphertext) {
+  return JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(iv) }, key, unb64(ciphertext))));
+}
+function generatePassword(len = 20) {
+  const set = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*?-_";
+  return Array.from(crypto.getRandomValues(new Uint32Array(len)), (n) => set[n % set.length]).join("");
+}
+
+// ---------- Armazenamento local (trocaremos por Supabase depois) ----------
+const readRows = () => JSON.parse(localStorage.getItem("cofre.items") || "[]");
+const writeRows = (r) => localStorage.setItem("cofre.items", JSON.stringify(r));
+
+const empty = { title: "", username: "", password: "", url: "", notes: "" };
+const LOCK_MS = 5 * 60 * 1000;
+
+function App() {
+  const [key, setKey] = useState(null);
+  const [items, setItems] = useState([]);
+  const [q, setQ] = useState("");
+  const [edit, setEdit] = useState(null);
+  const [shown, setShown] = useState(null);
+  const timer = useRef();
+
+  const lock = () => { setKey(null); setItems([]); setEdit(null); };
+  useEffect(() => {
+    if (!key) return;
+    const reset = () => { clearTimeout(timer.current); timer.current = setTimeout(lock, LOCK_MS); };
+    const evts = ["click", "keydown", "mousemove"];
+    evts.forEach((e) => window.addEventListener(e, reset)); reset();
+    return () => { evts.forEach((e) => window.removeEventListener(e, reset)); clearTimeout(timer.current); };
+  }, [key]);
+
+  async function load(k) {
+    const out = [];
+    for (const r of readRows()) out.push({ id: r.id, ...(await decryptJSON(k, r.iv, r.ciphertext)) });
+    setItems(out);
+  }
+  async function save() {
+    if (!edit || !edit.title) return;
+    const { id, ...secret } = edit;
+    const p = await encryptJSON(key, secret);
+    const rows = readRows();
+    writeRows(id ? rows.map((r) => (r.id === id ? { id, ...p } : r)) : [...rows, { id: crypto.randomUUID(), ...p }]);
+    setEdit(null); load(key);
+  }
+  function remove(id) {
+    if (!confirm("Excluir este item? Não dá para desfazer.")) return;
+    writeRows(readRows().filter((r) => r.id !== id)); load(key);
+  }
+  const copy = async (t) => { try { await navigator.clipboard.writeText(t); setTimeout(() => navigator.clipboard.writeText(""), 20000); } catch { alert("Não foi possível copiar. Use “Mostrar” e copie manualmente."); } };
+
+  if (!key) return <Login onDone={async (k) => { setKey(k); await load(k); }} />;
+
+  const list = items.filter((i) => (i.title + i.username + i.url).toLowerCase().includes(q.toLowerCase()));
+  return (
+    <div className="shell">
+      <header>
+        <h1>Cofre</h1>
+        <input className="search" placeholder="Buscar no cofre" value={q} onChange={(e) => setQ(e.target.value)} />
+        <button onClick={() => setEdit({ ...empty, password: generatePassword() })}>Novo item</button>
+        <button className="ghost" onClick={lock}>Bloquear</button>
+      </header>
+      <p className="who">Cofre neste dispositivo · {items.length} {items.length === 1 ? "item" : "itens"}</p>
+      {list.length === 0 && <p className="empty">Nenhum item ainda. Clique em “Novo item” para guardar sua primeira senha.</p>}
+      <ul>
+        {list.map((i) => (
+          <li key={i.id}>
+            <div className="main"><strong>{i.title}</strong><span>{i.username}</span></div>
+            <code>{shown === i.id ? i.password : "••••••••••"}</code>
+            <button className="ghost" onClick={() => setShown(shown === i.id ? null : i.id)}>{shown === i.id ? "Ocultar" : "Mostrar"}</button>
+            <button className="ghost" onClick={() => copy(i.password)}>Copiar</button>
+            <button className="ghost" onClick={() => setEdit(i)}>Editar</button>
+            <button className="ghost danger" onClick={() => remove(i.id)}>Excluir</button>
+          </li>
+        ))}
+      </ul>
+      {edit && (
+        <div className="modal" onClick={() => setEdit(null)}>
+          <div className="card" onClick={(e) => e.stopPropagation()}>
+            <h2>{edit.id ? "Editar item" : "Novo item"}</h2>
+            {[["title", "Título"], ["username", "Usuário ou e-mail"], ["url", "Endereço do site"]].map(([f, l]) => (
+              <label key={f}>{l}<input value={edit[f]} onChange={(e) => setEdit({ ...edit, [f]: e.target.value })} /></label>
+            ))}
+            <label>Senha
+              <div className="row"><input value={edit.password} onChange={(e) => setEdit({ ...edit, password: e.target.value })} />
+                <button className="ghost" onClick={() => setEdit({ ...edit, password: generatePassword() })}>Gerar</button></div>
+            </label>
+            <label>Notas<textarea rows={3} value={edit.notes} onChange={(e) => setEdit({ ...edit, notes: e.target.value })} /></label>
+            <div className="row end"><button className="ghost" onClick={() => setEdit(null)}>Cancelar</button><button onClick={save}>Salvar item</button></div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Login({ onDone }) {
+  const hasVault = !!localStorage.getItem("cofre.check");
+  const [master, setMaster] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function go() {
+    setErr(""); setBusy(true);
+    try {
+      if (!hasVault) {
+        if (master.length < 12) throw new Error("A senha mestra precisa ter pelo menos 12 caracteres.");
+        const salt = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+        const k = await deriveKey(master, salt);
+        localStorage.setItem("cofre.salt", salt);
+        localStorage.setItem("cofre.check", JSON.stringify(await encryptJSON(k, { ok: true })));
+        onDone(k);
+      } else {
+        const k = await deriveKey(master, localStorage.getItem("cofre.salt"));
+        const c = JSON.parse(localStorage.getItem("cofre.check"));
+        try { await decryptJSON(k, c.iv, c.ciphertext); } catch { throw new Error("Senha mestra incorreta."); }
+        onDone(k);
+      }
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="login">
+      <h1>Cofre</h1>
+      <p>Suas senhas são cifradas no seu navegador. Ninguém consegue lê-las sem a senha mestra.</p>
+      <p className="note">Os dados ficam só neste navegador. Limpar os dados do navegador apaga o cofre.</p>
+      <label>{hasVault ? "Senha mestra" : "Crie sua senha mestra"}
+        <input type="password" value={master} onChange={(e) => setMaster(e.target.value)} onKeyDown={(e) => e.key === "Enter" && go()} /></label>
+      {!hasVault && <p className="warn">Se você esquecer a senha mestra, não há como recuperar o cofre. Anote-a em um lugar seguro.</p>}
+      {err && <p className="err">{err}</p>}
+      <button disabled={busy || !master} onClick={go}>{busy ? "Aguarde…" : hasVault ? "Abrir cofre" : "Criar cofre"}</button>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
 </html>
