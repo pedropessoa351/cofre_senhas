@@ -1,0 +1,30 @@
+:root{--bg:#f3f5f4;--ink:#14231f;--mute:#5b6b66;--line:#d5dcd9;--card:#fff;--acc:#0f5c4d;--danger:#a43a2a}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1614;--ink:#e6efec;--mute:#93a59f;--line:#26362f;--card:#152220;--acc:#5fd0b4;--danger:#e58b7a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.5 "IBM Plex Sans",system-ui,sans-serif}
+h1,h2{font-family:"Bricolage Grotesque",system-ui,sans-serif;margin:0}
+button{font:500 14px "IBM Plex Sans",system-ui,sans-serif;padding:8px 14px;border:1px solid var(--acc);background:var(--acc);color:var(--bg);border-radius:6px;cursor:pointer}
+button.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
+button.danger{color:var(--danger)}
+button:disabled{opacity:.5}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+input,textarea{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);font:inherit}
+label{display:block;margin:12px 0;font-size:14px;color:var(--mute)}
+label input,label textarea{margin-top:4px}
+.shell{max-width:820px;margin:0 auto;padding:24px 16px}
+header{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+header h1{font-size:28px;margin-right:auto}
+.search{width:220px}
+.who{color:var(--mute);font-size:14px;margin:8px 0 16px}
+ul{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+li{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line)}
+.main{flex:1 1 200px;display:flex;flex-direction:column}.main span{color:var(--mute);font-size:14px}
+code{font-size:14px;min-width:120px}
+.empty{color:var(--mute);padding:32px 0}
+.login{max-width:400px;margin:12vh auto;padding:0 16px;display:grid;gap:4px}
+.login h1{font-size:40px}.login p{color:var(--mute)}
+.warn{color:var(--danger);font-size:14px}.err{color:var(--danger)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:grid;place-items:center;padding:16px}
+.card{background:var(--card);border-radius:10px;padding:20px;width:100%;max-width:440px;max-height:90vh;overflow:auto}
+.row{display:flex;gap:8px}.end{justify-content:flex-end;margin-top:8px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
