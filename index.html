@@ -35,6 +35,14 @@ code{font-size:14px;min-width:120px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:grid;place-items:center;padding:16px}
 .card{background:var(--card);border-radius:10px;padding:20px;width:100%;max-width:440px;max-height:90vh;overflow:auto}
 .row{display:flex;gap:8px}.end{justify-content:flex-end;margin-top:8px}
+.tabs{display:flex;gap:4px;margin:14px 0 4px;border-bottom:1px solid var(--line)}
+.tab{background:transparent;color:var(--mute);border:0;border-bottom:2px solid transparent;border-radius:0;padding:8px 12px}
+.tab.on{color:var(--ink);border-bottom-color:var(--acc)}
+.panel{padding:18px 0;border-bottom:1px solid var(--line)}.panel h2{font-size:18px;margin-bottom:6px}
+.panel .note{color:var(--mute);margin:6px 0}.panel .note.err{color:var(--danger)}
+.chk{display:flex;gap:8px;align-items:center;color:var(--ink);font-size:16px}.chk input{width:auto;margin:0}
+.banner{border:1px solid var(--danger);border-radius:8px;padding:12px;margin-bottom:12px}
+details{margin-top:12px}pre{overflow:auto;font-size:12px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px}
 #fatal{padding:24px;color:#a43a2a;font-family:monospace;white-space:pre-wrap}
 </style>
 </head>
@@ -48,6 +56,7 @@ window.addEventListener("unhandledrejection", e => { document.getElementById("fa
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
 <script type="text/babel">
 const { useState, useEffect, useRef } = React;
@@ -75,12 +84,54 @@ function generatePassword(len = 20) {
   return Array.from(crypto.getRandomValues(new Uint32Array(len)), (n) => set[n % set.length]).join("");
 }
 
-// ---------- Armazenamento local (trocaremos por Supabase depois) ----------
+// ---------- Armazenamento local ----------
 const readRows = () => JSON.parse(localStorage.getItem("cofre.items") || "[]");
 const writeRows = (r) => localStorage.setItem("cofre.items", JSON.stringify(r));
+const toLocal = (r) => ({ id: r.id, iv: r.iv, ciphertext: r.ciphertext, deleted: r.deleted, updated_at: Date.parse(r.updated_at) });
 
 const empty = { title: "", username: "", password: "", url: "", notes: "" };
 const LOCK_MS = 5 * 60 * 1000;
+const fmt = (ms) => new Date(ms).toLocaleString("pt-BR");
+
+// ---------- Supabase (opcional, configurado na aba Sincronização) ----------
+function getClient() {
+  const url = localStorage.getItem("cofre.sb.url"), k = localStorage.getItem("cofre.sb.key");
+  if (!url || !k || !window.supabase) return null;
+  if (!getClient.c || getClient.sig !== url + k) { getClient.c = window.supabase.createClient(url, k); getClient.sig = url + k; }
+  return getClient.c;
+}
+
+const SQL = `-- Cofre: tabelas de sincronização (cole no SQL Editor do Supabase e clique em Run)
+
+create table if not exists public.vault_meta (
+  user_id uuid primary key default auth.uid() references auth.users(id) on delete cascade,
+  salt text not null,
+  check_iv text not null,
+  check_ciphertext text not null,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.vault_items (
+  id uuid primary key,
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  iv text not null default '',
+  ciphertext text not null default '',
+  deleted boolean not null default false,
+  updated_at timestamptz not null default now()
+);
+alter table public.vault_items add column if not exists deleted boolean not null default false;
+create index if not exists vault_items_user_idx on public.vault_items(user_id);
+
+alter table public.vault_meta enable row level security;
+alter table public.vault_items enable row level security;
+
+drop policy if exists "meta: dono" on public.vault_meta;
+create policy "meta: dono" on public.vault_meta
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+drop policy if exists "itens: dono" on public.vault_items;
+create policy "itens: dono" on public.vault_items
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);`;
 
 function App() {
   const [key, setKey] = useState(null);
@@ -88,9 +139,14 @@ function App() {
   const [q, setQ] = useState("");
   const [edit, setEdit] = useState(null);
   const [shown, setShown] = useState(null);
-  const timer = useRef();
+  const [tab, setTab] = useState("cofre");
+  const [auto, setAuto] = useState(localStorage.getItem("cofre.sync.auto") === "1");
+  const [sync, setSync] = useState({ state: "idle", last: Number(localStorage.getItem("cofre.sync.last")) || 0, error: "" });
+  const timer = useRef(), syncTimer = useRef(), busy = useRef(false), again = useRef(false);
+  const keyRef = useRef(null), autoRef = useRef(auto), runRef = useRef();
+  keyRef.current = key; autoRef.current = auto;
 
-  const lock = () => { setKey(null); setItems([]); setEdit(null); };
+  const lock = () => { setKey(null); setItems([]); setEdit(null); setTab("cofre"); };
   useEffect(() => {
     if (!key) return;
     const reset = () => { clearTimeout(timer.current); timer.current = setTimeout(lock, LOCK_MS); };
@@ -99,23 +155,110 @@ function App() {
     return () => { evts.forEach((e) => window.removeEventListener(e, reset)); clearTimeout(timer.current); };
   }, [key]);
 
+  // Sincronização automática: ao abrir o cofre, a cada 1 min, ao voltar à aba e ao reconectar
+  useEffect(() => {
+    if (!key || !auto) return;
+    const go = () => runRef.current(true);
+    go();
+    const iv = setInterval(go, 60000);
+    window.addEventListener("online", go); window.addEventListener("focus", go);
+    return () => { clearInterval(iv); window.removeEventListener("online", go); window.removeEventListener("focus", go); };
+  }, [key, auto]);
+
+  const changeAuto = (v) => { setAuto(v); localStorage.setItem("cofre.sync.auto", v ? "1" : "0"); };
+  const queueSync = () => {
+    if (!autoRef.current || !keyRef.current) return;
+    clearTimeout(syncTimer.current);
+    syncTimer.current = setTimeout(() => runRef.current(true), 2000);
+  };
+
   async function load(k) {
     const out = [];
-    for (const r of readRows()) out.push({ id: r.id, ...(await decryptJSON(k, r.iv, r.ciphertext)) });
+    for (const r of readRows()) if (!r.deleted) out.push({ id: r.id, ...(await decryptJSON(k, r.iv, r.ciphertext)) });
     setItems(out);
   }
+
   async function save() {
     if (!edit || !edit.title) return;
     const { id, ...secret } = edit;
     const p = await encryptJSON(key, secret);
+    const row = { id: id || crypto.randomUUID(), ...p, deleted: false, updated_at: Date.now() };
     const rows = readRows();
-    writeRows(id ? rows.map((r) => (r.id === id ? { id, ...p } : r)) : [...rows, { id: crypto.randomUUID(), ...p }]);
-    setEdit(null); load(key);
+    writeRows(id ? rows.map((r) => (r.id === id ? row : r)) : [...rows, row]);
+    setEdit(null); load(key); queueSync();
   }
   function remove(id) {
     if (!confirm("Excluir este item? Não dá para desfazer.")) return;
-    writeRows(readRows().filter((r) => r.id !== id)); load(key);
+    writeRows(readRows().map((r) => (r.id === id ? { id, iv: "", ciphertext: "", deleted: true, updated_at: Date.now() } : r)));
+    load(key); queueSync();
   }
+
+  // Sincronização em dois sentidos: vence a versão mais recente de cada item
+  async function runSync(silent) {
+    if (busy.current) { again.current = true; return; }
+    const sb = getClient();
+    const session = sb ? (await sb.auth.getSession()).data.session : null;
+    if (!sb || !session) {
+      if (!silent) setSync((s) => ({ ...s, state: "error", error: "Salve a conexão e entre na conta, na aba Sincronização." }));
+      return;
+    }
+    busy.current = true; setSync((s) => ({ ...s, state: "syncing", error: "" }));
+    try {
+      const salt = localStorage.getItem("cofre.salt"), check = JSON.parse(localStorage.getItem("cofre.check"));
+      const { data: meta, error: me } = await sb.from("vault_meta").select("*").maybeSingle();
+      if (me) throw me;
+      if (!meta) {
+        const { error } = await sb.from("vault_meta").insert({ salt, check_iv: check.iv, check_ciphertext: check.ciphertext });
+        if (error) throw error;
+      } else if (meta.salt !== salt) { setSync((s) => ({ ...s, state: "conflict" })); return; }
+
+      const { data: cloud, error: ce } = await sb.from("vault_items").select("id,iv,ciphertext,updated_at,deleted");
+      if (ce) throw ce;
+      const local = readRows().map((r) => (r.updated_at ? r : { ...r, updated_at: Date.now() }));
+      const lmap = new Map(local.map((r) => [r.id, r])), cmap = new Map(cloud.map((r) => [r.id, toLocal(r)]));
+      const merged = [], push = [];
+      for (const id of new Set([...lmap.keys(), ...cmap.keys()])) {
+        const l = lmap.get(id), c = cmap.get(id);
+        if (l && (!c || l.updated_at > c.updated_at)) {
+          merged.push(l);
+          push.push({ id, iv: l.iv, ciphertext: l.ciphertext, deleted: !!l.deleted, updated_at: new Date(l.updated_at).toISOString() });
+        } else merged.push(c);
+      }
+      if (push.length) { const { error } = await sb.from("vault_items").upsert(push); if (error) throw error; }
+
+      // Reaplica o que mudou localmente enquanto a sincronização rodava
+      const cur = readRows(), curMap = new Map(cur.map((r) => [r.id, r]));
+      const final = merged.map((m) => { const c2 = curMap.get(m.id); return c2 && (c2.updated_at || 0) > m.updated_at ? (again.current = true, c2) : m; });
+      for (const c2 of cur) if (!lmap.has(c2.id) && !cmap.has(c2.id)) { final.push(c2); again.current = true; }
+      writeRows(final);
+
+      const last = Date.now();
+      localStorage.setItem("cofre.sync.last", String(last));
+      setSync({ state: "ok", last, error: "" });
+      if (keyRef.current) await load(keyRef.current);
+    } catch (e) {
+      setSync((s) => ({ ...s, state: "error", error: e.message || String(e) }));
+    } finally {
+      busy.current = false;
+      if (again.current) { again.current = false; setTimeout(() => runRef.current(true), 500); }
+    }
+  }
+  runRef.current = runSync;
+
+  async function restore() {
+    if (!confirm("Isto substitui o cofre deste aparelho pelo cofre da nuvem. Itens que existem só aqui serão perdidos. Continuar?")) return;
+    try {
+      const sb = getClient();
+      const { data: meta, error: e1 } = await sb.from("vault_meta").select("*").single(); if (e1) throw e1;
+      const { data: cloud, error: e2 } = await sb.from("vault_items").select("id,iv,ciphertext,updated_at,deleted"); if (e2) throw e2;
+      localStorage.setItem("cofre.salt", meta.salt);
+      localStorage.setItem("cofre.check", JSON.stringify({ iv: meta.check_iv, ciphertext: meta.check_ciphertext }));
+      writeRows(cloud.map(toLocal));
+      lock();
+      alert("Cofre da nuvem restaurado. Entre com a mesma senha mestra que você usa nos outros aparelhos.");
+    } catch (e) { setSync((s) => ({ ...s, state: "error", error: e.message || String(e) })); }
+  }
+
   const copy = async (t) => { try { await navigator.clipboard.writeText(t); setTimeout(() => navigator.clipboard.writeText(""), 20000); } catch { alert("Não foi possível copiar. Use “Mostrar” e copie manualmente."); } };
 
   if (!key) return <Login onDone={async (k) => { setKey(k); await load(k); }} />;
@@ -125,24 +268,34 @@ function App() {
     <div className="shell">
       <header>
         <h1>Cofre</h1>
-        <input className="search" placeholder="Buscar no cofre" value={q} onChange={(e) => setQ(e.target.value)} />
-        <button onClick={() => setEdit({ ...empty, password: generatePassword() })}>Novo item</button>
+        {tab === "cofre" && <input className="search" placeholder="Buscar no cofre" value={q} onChange={(e) => setQ(e.target.value)} />}
+        {tab === "cofre" && <button onClick={() => setEdit({ ...empty, password: generatePassword() })}>Novo item</button>}
         <button className="ghost" onClick={lock}>Bloquear</button>
       </header>
-      <p className="who">Cofre neste dispositivo · {items.length} {items.length === 1 ? "item" : "itens"}</p>
-      {list.length === 0 && <p className="empty">Nenhum item ainda. Clique em “Novo item” para guardar sua primeira senha.</p>}
-      <ul>
-        {list.map((i) => (
-          <li key={i.id}>
-            <div className="main"><strong>{i.title}</strong><span>{i.username}</span></div>
-            <code>{shown === i.id ? i.password : "••••••••••"}</code>
-            <button className="ghost" onClick={() => setShown(shown === i.id ? null : i.id)}>{shown === i.id ? "Ocultar" : "Mostrar"}</button>
-            <button className="ghost" onClick={() => copy(i.password)}>Copiar</button>
-            <button className="ghost" onClick={() => setEdit(i)}>Editar</button>
-            <button className="ghost danger" onClick={() => remove(i.id)}>Excluir</button>
-          </li>
-        ))}
-      </ul>
+      <nav className="tabs">
+        <button className={"tab" + (tab === "cofre" ? " on" : "")} onClick={() => setTab("cofre")}>Cofre</button>
+        <button className={"tab" + (tab === "sync" ? " on" : "")} onClick={() => setTab("sync")}>Sincronização</button>
+      </nav>
+      {tab === "sync" ? (
+        <SyncTab sync={sync} auto={auto} setAuto={changeAuto} runSync={runSync} restore={restore} />
+      ) : (
+        <>
+          <p className="who">{items.length} {items.length === 1 ? "item" : "itens"}{sync.state === "conflict" ? " · conflito de sincronização, veja a aba Sincronização" : sync.state === "error" ? " · falha ao sincronizar" : ""}</p>
+          {list.length === 0 && <p className="empty">Nenhum item ainda. Clique em “Novo item” para guardar sua primeira senha.</p>}
+          <ul>
+            {list.map((i) => (
+              <li key={i.id}>
+                <div className="main"><strong>{i.title}</strong><span>{i.username}</span></div>
+                <code>{shown === i.id ? i.password : "••••••••••"}</code>
+                <button className="ghost" onClick={() => setShown(shown === i.id ? null : i.id)}>{shown === i.id ? "Ocultar" : "Mostrar"}</button>
+                <button className="ghost" onClick={() => copy(i.password)}>Copiar</button>
+                <button className="ghost" onClick={() => setEdit(i)}>Editar</button>
+                <button className="ghost danger" onClick={() => remove(i.id)}>Excluir</button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
       {edit && (
         <div className="modal" onClick={() => setEdit(null)}>
           <div className="card" onClick={(e) => e.stopPropagation()}>
@@ -159,6 +312,92 @@ function App() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function SyncTab({ sync, auto, setAuto, runSync, restore }) {
+  const [url, setUrl] = useState(localStorage.getItem("cofre.sb.url") || "");
+  const [akey, setAkey] = useState(localStorage.getItem("cofre.sb.key") || "");
+  const [email, setEmail] = useState("");
+  const [pass, setPass] = useState("");
+  const [who, setWho] = useState(null);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const sb = getClient();
+    if (!sb) return setWho(null);
+    const { data } = await sb.auth.getSession();
+    setWho(data.session ? data.session.user.email : null);
+  };
+  useEffect(() => { refresh(); }, []);
+
+  function saveCfg() {
+    localStorage.setItem("cofre.sb.url", url.trim().replace(/\/+$/, ""));
+    localStorage.setItem("cofre.sb.key", akey.trim());
+    setMsg("Conexão salva."); refresh();
+  }
+  async function auth(kind) {
+    setMsg(""); setBusy(true);
+    try {
+      const sb = getClient();
+      if (!sb) throw new Error(window.supabase ? "Salve a URL e a chave antes de entrar." : "A biblioteca do Supabase não carregou. Verifique a internet.");
+      const { data, error } = kind === "up" ? await sb.auth.signUp({ email, password: pass }) : await sb.auth.signInWithPassword({ email, password: pass });
+      if (error) throw error;
+      setPass("");
+      if (kind === "up" && !data.session) return setMsg("Conta criada. Confirme o e-mail enviado pelo Supabase e depois clique em Entrar.");
+      setMsg("Conectado."); await refresh(); runSync(false);
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+  async function out() { await getClient().auth.signOut(); await refresh(); setMsg("Você saiu da conta de sincronização."); }
+
+  const status = sync.state === "syncing" ? "Sincronizando…"
+    : sync.state === "error" ? "Erro: " + sync.error
+    : sync.last ? "Última sincronização: " + fmt(sync.last) : "Ainda não sincronizado.";
+
+  return (
+    <div>
+      <section className="panel">
+        <h2>1. Conexão com o Supabase</h2>
+        <p className="note">Em Project Settings → API, copie a Project URL e a chave <b>anon public</b>. Ela é pública por design; a proteção vem do RLS e da cifragem.</p>
+        <label>Project URL<input placeholder="https://xxxx.supabase.co" value={url} onChange={(e) => setUrl(e.target.value)} /></label>
+        <label>Chave anon public<input value={akey} onChange={(e) => setAkey(e.target.value)} /></label>
+        <button onClick={saveCfg} disabled={!url || !akey}>Salvar conexão</button>
+        <details><summary>Precisa do SQL das tabelas?</summary>
+          <pre>{SQL}</pre>
+          <button className="ghost" onClick={() => navigator.clipboard.writeText(SQL).then(() => setMsg("SQL copiado."))}>Copiar SQL</button>
+        </details>
+      </section>
+
+      <section className="panel">
+        <h2>2. Conta de sincronização</h2>
+        {who ? (
+          <div className="row"><span style={{ flex: 1 }}>Conectado como <b>{who}</b></span><button className="ghost" onClick={out}>Sair</button></div>
+        ) : (<>
+          <p className="note">Use uma senha <b>diferente</b> da senha mestra. Assim o servidor nunca tem como abrir o seu cofre.</p>
+          <label>E-mail<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+          <label>Senha da conta<input type="password" value={pass} onChange={(e) => setPass(e.target.value)} /></label>
+          <div className="row"><button disabled={busy || !email || !pass} onClick={() => auth("in")}>Entrar</button>
+            <button className="ghost" disabled={busy || !email || !pass} onClick={() => auth("up")}>Criar conta</button></div>
+        </>)}
+        {msg && <p className="note">{msg}</p>}
+      </section>
+
+      <section className="panel">
+        <h2>3. Sincronização</h2>
+        {sync.state === "conflict" && (
+          <div className="banner">
+            <p>A nuvem guarda outro cofre, com outra chave. Se este é um aparelho novo, use o cofre da nuvem aqui. Se você criou um cofre diferente por engano, o app não mistura os dois.</p>
+            <button onClick={restore}>Usar o cofre da nuvem neste aparelho</button>
+          </div>
+        )}
+        <label className="chk"><input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />Sincronizar automaticamente</label>
+        <p className="note">Envia as mudanças 2 segundos depois de salvar e confere a nuvem a cada minuto, enquanto o cofre estiver aberto.</p>
+        <div className="row"><button disabled={!who || sync.state === "syncing"} onClick={() => runSync(false)}>Sincronizar agora</button></div>
+        <p className={"note" + (sync.state === "error" ? " err" : "")} aria-live="polite">{status}</p>
+        <p className="note">Aparelho novo: crie um cofre qualquer, entre na conta acima e clique em “Usar o cofre da nuvem neste aparelho”.</p>
+      </section>
     </div>
   );
 }
@@ -192,7 +431,7 @@ function Login({ onDone }) {
     <div className="login">
       <h1>Cofre</h1>
       <p>Suas senhas são cifradas no seu navegador. Ninguém consegue lê-las sem a senha mestra.</p>
-      <p className="note">Os dados ficam só neste navegador. Limpar os dados do navegador apaga o cofre.</p>
+      <p className="note">Os dados ficam neste navegador. Para usar em outros aparelhos, ative a sincronização depois de entrar. Limpar os dados do navegador apaga o cofre local.</p>
       <label>{hasVault ? "Senha mestra" : "Crie sua senha mestra"}
         <input type="password" value={master} onChange={(e) => setMaster(e.target.value)} onKeyDown={(e) => e.key === "Enter" && go()} /></label>
       {!hasVault && <p className="warn">Se você esquecer a senha mestra, não há como recuperar o cofre. Anote-a em um lugar seguro.</p>}
